@@ -10,3 +10,8 @@ app.get("/", (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+// health endpoint (no auth, fast)
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok' });
+});
