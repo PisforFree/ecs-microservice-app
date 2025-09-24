@@ -1,5 +1,5 @@
 # Use Debian-based Apache (smaller: bookworm-slim also works)
-FROM httpd:2.4-bookworm
+FROM httpd:2.4
 
 # Install curl for the health check (bookworm images don't include it by default)
 RUN apt-get update \
