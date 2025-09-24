@@ -1,0 +1,88 @@
+name: CI - Build & Push to ECR
+
+on:
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPO:   ${{ secrets.ECR_REPO }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write        # REQUIRED for OIDC
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # (Optional) If your app has tests, add them here. Example:
+      # - name: Run unit tests
+      #   run: |
+      #     echo "No tests defined yet."
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tags
+        id: vars
+        shell: bash
+        run: |
+          echo "sha=${GITHUB_SHA}" >> $GITHUB_OUTPUT
+          echo "branch=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build -t $ECR_REGISTRY/${{ env.ECR_REPO }}:${{ steps.vars.outputs.sha }} \
+                       -t $ECR_REGISTRY/${{ env.ECR_REPO }}:${{ steps.vars.outputs.branch }} .
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.vars.outputs.sha }}
+          format: 'table'
+          exit-code: '1'              # fail on detected vulns
+          vuln-type: 'os,library'
+          ignore-unfixed: true
+
+      - name: Push image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker push $ECR_REGISTRY/${{ env.ECR_REPO }}:${{ steps.vars.outputs.sha }}
+          docker push $ECR_REGISTRY/${{ env.ECR_REPO }}:${{ steps.vars.outputs.branch }}
+
+      - name: Get image digest
+        id: digest
+        run: |
+          DIGEST=$(aws ecr describe-images \
+            --repository-name "${{ env.ECR_REPO }}" \
+            --image-ids imageTag=${{ steps.vars.outputs.sha }} \
+            --query 'imageDetails[0].imageDigest' --output text)
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "$DIGEST" > digest.txt
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-digest
+          path: digest.txt
+
+      - name: Summary
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "Image pushed:" >> $GITHUB_STEP_SUMMARY
+          echo "\`$ECR_REGISTRY/${{ env.ECR_REPO }}@${{ steps.digest.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
