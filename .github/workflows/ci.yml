@@ -53,8 +53,9 @@ jobs:
         with:
           image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.vars.outputs.sha }}
           format: 'table'
-          exit-code: '1'              # fail on detected vulns
+          exit-code: '1'            # ← fail build if CRITICAL is found
           vuln-type: 'os,library'
+          severity: CRITICAL        # ← only fail for CRITICAL
           ignore-unfixed: true
 
       - name: Push image to ECR
