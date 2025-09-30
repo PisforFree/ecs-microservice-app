@@ -100,12 +100,22 @@ jobs:
           echo "IMAGE_URI=${{ steps.image.outputs.uri }}"
           echo "IMAGE_DIGEST=${{ steps.digest.outputs.digest }}"
 
+      - name: Probe PAT access to deploy repo
+        if: github.event_name == 'push'
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.DEPLOY_REPO_TOKEN }}" \
+            https://api.github.com/repos/PisforFree/ecs-microservice-deploy)
+          echo "HTTP $code from GitHub API"
+          test "$code" = "200"
+
+
       # ---- Mini-Step 6.3: Open PR to deploy repo with new digest ----
       - name: Checkout deploy repo (target branch) into subfolder
         if: github.event_name == 'push'
         uses: actions/checkout@v4
         with:
-          repository: PisorFree/ecs-microservice-deploy
+          repository: PisforFree/ecs-microservice-deploy
           ref: main
           token: ${{ secrets.DEPLOY_REPO_TOKEN }}
           path: deploy-repo
