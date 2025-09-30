@@ -24,7 +24,7 @@ env:
   ECR_REPO:           ${{ secrets.ECR_REPO }}
 
   # Mini-Step 6.3 (auto-PR to deploy repo)
-  DEPLOY_REPO:   "PisorFree/ecs-microservice-deploy"
+  DEPLOY_REPO:   "PisforFree/ecs-microservice-deploy"
   DEPLOY_BRANCH: "main"
 
 jobs:
