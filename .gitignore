@@ -1,0 +1,21 @@
+# General
+.DS_Store
+*.log
+.env
+*.pem
+*.zip
+
+# Node (future-proof if needed)
+node_modules/
+
+# Docker
+**/Dockerfile.dev
+
+# Terraform (just in case)
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+crash.log
+override.tf
+override.tf.json
