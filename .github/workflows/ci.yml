@@ -131,10 +131,41 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          FILE="environments/dev/app.auto.tfvars"
-          test -f "$FILE" || { echo "Missing $FILE in deploy repo"; exit 1; }
+
+          # 1) Try common locations for the file
+          CANDIDATES=(
+            "environments/dev/app.auto.tfvars"
+            "infra/terraform/environments/dev/app.auto.tfvars"
+            "terraform/environments/dev/app.auto.tfvars"
+          )
+
+          FILE=""
+          for f in "${CANDIDATES[@]}"; do
+            if [ -f "$f" ]; then
+              FILE="$f"
+              break
+            fi
+          done
+
+          # 2) If not found, create the standard path
+          if [ -z "${FILE}" ]; then
+            FILE="environments/dev/app.auto.tfvars"
+            mkdir -p "$(dirname "$FILE")"
+
+            # If your deploy repo defines ecr_repo_uri elsewhere, keep only image_digest here.
+            # Otherwise, set both.
+            if ! grep -q "^ecr_repo_uri" "$FILE" 2>/dev/null; then
+              echo 'ecr_repo_uri = "803767876973.dkr.ecr.us-east-2.amazonaws.com/microservice"' >> "$FILE"
+            fi
+            echo 'image_digest = "sha256:PLACEHOLDER"' >> "$FILE"
+            echo "Created $FILE"
+          fi
+
+          # 3) Update the digest in whichever file we located/created
           sed -i -E "s#^image_digest\\s*=\\s*\"sha256:[^\"]+\"#image_digest = \"${NEW_DIGEST}\"#g" "$FILE"
-          echo "Updated line in $FILE:"; grep -n "^image_digest" "$FILE"
+
+          echo "Updated line in $FILE:"
+          grep -n "^image_digest" "$FILE"
 
       - name: Create Pull Request in deploy repo
         if: github.event_name == 'push'
