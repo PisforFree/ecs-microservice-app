@@ -2,64 +2,105 @@ name: CI - Build & Push to ECR
 
 on:
   push:
-    branches: [ "main" ]   # change if you prefer dev
+    branches: [dev, main]       # Full build + push when merged to dev/main
+  pull_request:
+    branches: [dev, main]       # Build & scan only on PRs (no push)
   workflow_dispatch:
-
-permissions:
-  id-token: write   # needed for OIDC
-  contents: read
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
-  AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-  ECR_REPO: ${{ secrets.ECR_REPO }}
+  ECR_REPO:   ${{ secrets.ECR_REPO }}
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write        # REQUIRED for OIDC
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Example test stage (safe for PRs)
+      - name: Run unit tests
+        run: |
+          echo "No tests defined yet."
+
+      # Configure AWS creds only on push (not PR)
       - name: Configure AWS credentials (OIDC)
+        if: ${{ github.event_name == 'push' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Login to ECR only on push
       - name: Login to Amazon ECR
+        if: ${{ github.event_name == 'push' }}
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Set image variables
+      - name: Set image tags
         id: vars
+        shell: bash
         run: |
-          echo "ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}" >> $GITHUB_ENV
-          echo "IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
+          echo "sha=${GITHUB_SHA}" >> $GITHUB_OUTPUT
+          echo "branch=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
 
-      - name: Build & push (latest + sha tag)
-        uses: docker/build-push-action@v6
+      # Always build (PRs + pushes)
+      - name: Build Docker image
+        run: |
+          docker build -t localbuild:${{ steps.vars.outputs.sha }} .
+
+      # Always scan (PRs + pushes) — uses local tag for PRs
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.24.0
         with:
-          context: .
-          push: true
-          tags: |
-            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:latest
-            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
-          provenance: false
+          image-ref: localbuild:${{ steps.vars.outputs.sha }}
+          format: 'table'
+          exit-code: '1'            # fail build if CRITICAL found
+          vuln-type: 'os,library'
+          severity: CRITICAL
+          ignore-unfixed: true
 
-      - name: Get image digest for :latest
+      # Retag & push only on push
+      - name: Tag & Push to ECR
+        if: ${{ github.event_name == 'push' }}
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker tag localbuild:${{ steps.vars.outputs.sha }} \
+            $ECR_REGISTRY/${{ env.ECR_REPO }}:${{ steps.vars.outputs.sha }}
+          docker tag localbuild:${{ steps.vars.outputs.sha }} \
+            $ECR_REGISTRY/${{ env.ECR_REPO }}:${{ steps.vars.outputs.branch }}
+          docker push $ECR_REGISTRY/${{ env.ECR_REPO }}:${{ steps.vars.outputs.sha }}
+          docker push $ECR_REGISTRY/${{ env.ECR_REPO }}:${{ steps.vars.outputs.branch }}
+
+      # Get digest only on push
+      - name: Get image digest
+        if: ${{ github.event_name == 'push' }}
         id: digest
         run: |
           DIGEST=$(aws ecr describe-images \
             --repository-name "${{ env.ECR_REPO }}" \
-            --image-ids imageTag=latest \
+            --image-ids imageTag=${{ steps.vars.outputs.sha }} \
             --query 'imageDetails[0].imageDigest' --output text)
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
-          echo "Full URI: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}@$DIGEST"
+          echo "$DIGEST" > digest.txt
 
+      # Upload digest only on push
+      - name: Upload digest artifact
+        if: ${{ github.event_name == 'push' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-digest
+          path: digest.txt
+
+      # Summary only on push
       - name: Summary
+        if: ${{ github.event_name == 'push' }}
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          echo "Pushed:"
-          echo "  ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:latest"
-          echo "  ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}"
-          echo "Digest: ${{ steps.digest.outputs.digest }}"
+          echo "Image pushed:" >> $GITHUB_STEP_SUMMARY
+          echo "\`$ECR_REGISTRY/${{ env.ECR_REPO }}@${{ steps.digest.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
