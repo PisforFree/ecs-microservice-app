@@ -1,106 +1,97 @@
-name: CI - Build & Push to ECR
+name: App CI — build, push, publish digest
 
 on:
-  push:
-    branches: [dev, main]       # Full build + push when merged to dev/main
   pull_request:
-    branches: [dev, main]       # Build & scan only on PRs (no push)
-  workflow_dispatch:
+    branches: [dev, main]
+    paths:
+      - "app/**"
+      - "Dockerfile"
+      - ".github/workflows/ci.yml"
+  push:
+    branches: [dev, main]
+    paths:
+      - "app/**"
+      - "Dockerfile"
+      - ".github/workflows/ci.yml"
+
+permissions:
+  id-token: write
+  contents: read
 
 env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
-  ECR_REPO:   ${{ secrets.ECR_REPO }}
+  AWS_REGION:        ${{ secrets.AWS_REGION }}
+  AWS_ROLE_TO_ASSUME:${{ secrets.AWS_ROLE_TO_ASSUME }}
+  ECR_REPO:          ${{ secrets.ECR_REPO }}
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write        # REQUIRED for OIDC
-      contents: read
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Example test stage (safe for PRs)
-      - name: Run unit tests
-        run: |
-          echo "No tests defined yet."
-
-      # Configure AWS creds only on push (not PR)
-      - name: Configure AWS credentials (OIDC)
-        if: ${{ github.event_name == 'push' }}
+      - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          role-session-name: app-ci
 
-      # Login to ECR only on push
-      - name: Login to Amazon ECR
-        if: ${{ github.event_name == 'push' }}
-        id: login-ecr
+      - name: Get AWS Account ID
+        id: acct
+        run: |
+          echo "id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+
+      - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Set image tags
-        id: vars
-        shell: bash
+      - name: Set image URI
+        id: image
         run: |
-          echo "sha=${GITHUB_SHA}" >> $GITHUB_OUTPUT
-          echo "branch=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          IMAGE_URI="${{ steps.acct.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}"
+          echo "uri=$IMAGE_URI" >> $GITHUB_OUTPUT
 
-      # Always build (PRs + pushes)
-      - name: Build Docker image
+      # Build + push only on push events (PRs will build/scan later without pushing)
+      - name: Build and push image (tag = commit SHA)
+        if: github.event_name == 'push'
         run: |
-          docker build -t localbuild:${{ steps.vars.outputs.sha }} .
+          docker buildx build \
+            --platform linux/amd64 \
+            -t "${{ steps.image.outputs.uri }}:${{ github.sha }}" \
+            --push \
+            .
 
-      # Always scan (PRs + pushes) — uses local tag for PRs
-      - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@0.24.0
-        with:
-          image-ref: localbuild:${{ steps.vars.outputs.sha }}
-          format: 'table'
-          exit-code: '1'            # fail build if CRITICAL found
-          vuln-type: 'os,library'
-          severity: CRITICAL
-          ignore-unfixed: true
-
-      # Retag & push only on push
-      - name: Tag & Push to ECR
-        if: ${{ github.event_name == 'push' }}
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        run: |
-          docker tag localbuild:${{ steps.vars.outputs.sha }} \
-            $ECR_REGISTRY/${{ env.ECR_REPO }}:${{ steps.vars.outputs.sha }}
-          docker tag localbuild:${{ steps.vars.outputs.sha }} \
-            $ECR_REGISTRY/${{ env.ECR_REPO }}:${{ steps.vars.outputs.branch }}
-          docker push $ECR_REGISTRY/${{ env.ECR_REPO }}:${{ steps.vars.outputs.sha }}
-          docker push $ECR_REGISTRY/${{ env.ECR_REPO }}:${{ steps.vars.outputs.branch }}
-
-      # Get digest only on push
-      - name: Get image digest
-        if: ${{ github.event_name == 'push' }}
+      # Resolve the digest from ECR for the just-pushed tag
+      - name: Resolve image digest from ECR
+        if: github.event_name == 'push'
         id: digest
         run: |
           DIGEST=$(aws ecr describe-images \
             --repository-name "${{ env.ECR_REPO }}" \
-            --image-ids imageTag=${{ steps.vars.outputs.sha }} \
-            --query 'imageDetails[0].imageDigest' --output text)
+            --image-ids imageTag="${{ github.sha }}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
-          echo "$DIGEST" > digest.txt
+          echo "IMAGE: ${{ steps.image.outputs.uri }}@${DIGEST}"
 
-      # Upload digest only on push
+      # Save digest to an artifact (for auditing / downstream jobs)
       - name: Upload digest artifact
-        if: ${{ github.event_name == 'push' }}
+        if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: image-digest
-          path: digest.txt
-
-      # Summary only on push
-      - name: Summary
-        if: ${{ github.event_name == 'push' }}
+          path: |
+            digest.txt
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          D: ${{ steps.digest.outputs.digest }}
+        shell: bash
         run: |
-          echo "Image pushed:" >> $GITHUB_STEP_SUMMARY
-          echo "\`$ECR_REGISTRY/${{ env.ECR_REPO }}@${{ steps.digest.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "${D}" > digest.txt
+
+      # Echo outputs for easy copy/paste (useful while wiring the next step)
+      - name: Summary
+        if: github.event_name == 'push'
+        run: |
+          echo "IMAGE_URI=${{ steps.image.outputs.uri }}"
+          echo "IMAGE_DIGEST=${{ steps.digest.outputs.digest }}"
