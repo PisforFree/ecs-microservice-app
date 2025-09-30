@@ -105,8 +105,8 @@ jobs:
         if: github.event_name == 'push'
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.DEPLOY_REPO }}
-          ref: ${{ env.DEPLOY_BRANCH }}
+          repository: PisorFree/ecs-microservice-deploy
+          ref: main
           token: ${{ secrets.DEPLOY_REPO_TOKEN }}
           path: deploy-repo
 
