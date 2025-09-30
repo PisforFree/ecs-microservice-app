@@ -1,4 +1,4 @@
-name: App CI — build, push, publish digest
+﻿name: App CI  build, push, publish digest
 
 on:
   pull_request:
@@ -19,16 +19,20 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION:        ${{ secrets.AWS_REGION }}
-  AWS_ROLE_TO_ASSUME:${{ secrets.AWS_ROLE_TO_ASSUME }}
-  ECR_REPO:          ${{ secrets.ECR_REPO }}
+  AWS_REGION:         ${{ secrets.AWS_REGION }}
+  AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+  ECR_REPO:           ${{ secrets.ECR_REPO }}
+
+  # Mini-Step 6.3 (auto-PR to deploy repo)
+  DEPLOY_REPO:   "PisorFree/ecs-microservice-deploy"
+  DEPLOY_BRANCH: "main"
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout (app repo)
         uses: actions/checkout@v4
 
       - name: Configure AWS (OIDC)
@@ -52,7 +56,7 @@ jobs:
           IMAGE_URI="${{ steps.acct.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}"
           echo "uri=$IMAGE_URI" >> $GITHUB_OUTPUT
 
-      # Build + push only on push events (PRs will build/scan later without pushing)
+      # Build + push only on push events (PRs build/scan later without pushing)
       - name: Build and push image (tag = commit SHA)
         if: github.event_name == 'push'
         run: |
@@ -75,23 +79,65 @@ jobs:
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
           echo "IMAGE: ${{ steps.image.outputs.uri }}@${DIGEST}"
 
-      # Save digest to an artifact (for auditing / downstream jobs)
+      # Write digest to a file
+      - name: Write digest file
+        if: github.event_name == 'push'
+        run: |
+          echo "${{ steps.digest.outputs.digest }}" > digest.txt
+
+      # Upload digest artifact
       - name: Upload digest artifact
         if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: image-digest
-          path: |
-            digest.txt
-        env:
-          D: ${{ steps.digest.outputs.digest }}
-        shell: bash
-        run: |
-          echo "${D}" > digest.txt
+          path: digest.txt
 
-      # Echo outputs for easy copy/paste (useful while wiring the next step)
+      # Echo outputs for quick copy/paste
       - name: Summary
         if: github.event_name == 'push'
         run: |
           echo "IMAGE_URI=${{ steps.image.outputs.uri }}"
           echo "IMAGE_DIGEST=${{ steps.digest.outputs.digest }}"
+
+      # ---- Mini-Step 6.3: Open PR to deploy repo with new digest ----
+      - name: Checkout deploy repo (target branch) into subfolder
+        if: github.event_name == 'push'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEPLOY_REPO }}
+          ref: ${{ env.DEPLOY_BRANCH }}
+          token: ${{ secrets.DEPLOY_REPO_TOKEN }}
+          path: deploy-repo
+
+      - name: Prepare PR env
+        if: github.event_name == 'push'
+        run: |
+          echo "NEW_DIGEST=${{ steps.digest.outputs.digest }}" >> $GITHUB_ENV
+
+      - name: Update app.auto.tfvars with new digest
+        if: github.event_name == 'push'
+        working-directory: deploy-repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="environments/dev/app.auto.tfvars"
+          test -f "$FILE" || { echo "Missing $FILE in deploy repo"; exit 1; }
+          sed -i -E "s#^image_digest\\s*=\\s*\"sha256:[^\"]+\"#image_digest = \"${NEW_DIGEST}\"#g" "$FILE"
+          echo "Updated line in $FILE:"; grep -n "^image_digest" "$FILE"
+
+      - name: Create Pull Request in deploy repo
+        if: github.event_name == 'push'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.DEPLOY_REPO_TOKEN }}
+          path: deploy-repo
+          title: "chore(dev): pin ECS image to ${{ env.NEW_DIGEST }}"
+          body: |
+            Automated PR from app CI.
+            - Source repo: ${{ github.repository }}
+            - Commit: ${{ github.sha }}
+            - Digest: `${{ env.NEW_DIGEST }}`
+          branch: "chore/digest-${{ github.sha }}-to-${{ env.DEPLOY_BRANCH }}"
+          base: "${{ env.DEPLOY_BRANCH }}"
+          commit-message: "chore: update dev image_digest to ${{ env.NEW_DIGEST }}"
