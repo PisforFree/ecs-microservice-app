@@ -13,3 +13,5 @@ COPY site/ /usr/local/apache2/htdocs/
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 CMD curl -fsS http://localhost/ || exit 1
 
 EXPOSE 80
+
+# ci-test: trigger workflow
