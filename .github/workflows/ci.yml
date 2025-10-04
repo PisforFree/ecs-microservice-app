@@ -1,22 +1,20 @@
 ﻿name: App CI — build, push, publish digest
 
 on:
-  pull_request:
-    branches: [dev, main]
-    paths:
-      - "app/**"
-      - "Dockerfile"
-      - ".github/workflows/ci.yml"
   push:
     branches: [dev, main]
-    paths:
-      - "app/**"
-      - "Dockerfile"
-      - ".github/workflows/ci.yml"
+    # Removed path filters so simple bumps like VERSION will trigger CI
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
+
+concurrency:
+  group: app-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   AWS_REGION:         ${{ secrets.AWS_REGION }}
@@ -48,6 +46,7 @@ jobs:
           echo "id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
 
       - name: Login to ECR
+        id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Set image URI
@@ -55,37 +54,47 @@ jobs:
         run: |
           IMAGE_URI="${{ steps.acct.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}"
           echo "uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
 
-      # Build + push only on push events (PRs build/scan later without pushing)
+      # Build + push only on push events (PRs can lint/test separately later)
       - name: Build and push image (tag = commit SHA)
         if: github.event_name == 'push'
         run: |
           docker buildx build \
             --platform linux/amd64 \
-            -t "${{ steps.image.outputs.uri }}:${{ github.sha }}" \
+            -t "${IMAGE_URI}:${GITHUB_SHA}" \
             --push \
             .
 
-      # Resolve the digest from ECR for the just-pushed tag
-      - name: Resolve image digest from ECR
+      # Resolve the digest from ECR for the just-pushed tag (with retry)
+      - name: Resolve image digest from ECR (retry)
         if: github.event_name == 'push'
         id: digest
+        shell: bash
         run: |
-          DIGEST=$(aws ecr describe-images \
-            --repository-name "${{ env.ECR_REPO }}" \
-            --image-ids imageTag="${{ github.sha }}" \
-            --query 'imageDetails[0].imageDigest' \
-            --output text)
-          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
-          echo "IMAGE: ${{ steps.image.outputs.uri }}@${DIGEST}"
+          set -euo pipefail
+          for i in {1..6}; do
+            DIGEST=$(aws ecr describe-images \
+              --repository-name "${{ env.ECR_REPO }}" \
+              --image-ids imageTag="${GITHUB_SHA}" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text 2>/dev/null || true)
+            if [[ "$DIGEST" != "None" && -n "$DIGEST" ]]; then
+              echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+              echo "NEW_DIGEST=$DIGEST" >> $GITHUB_ENV
+              echo "Resolved digest: $DIGEST"
+              break
+            fi
+            echo "Digest not visible yet; retrying ($i/6)..."
+            sleep 5
+          done
+          test -n "${DIGEST:-}" || { echo "Failed to resolve digest"; exit 1; }
 
-      # Write digest to a file
       - name: Write digest file
         if: github.event_name == 'push'
         run: |
           echo "${{ steps.digest.outputs.digest }}" > digest.txt
 
-      # Upload digest artifact
       - name: Upload digest artifact
         if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
@@ -93,20 +102,19 @@ jobs:
           name: image-digest
           path: digest.txt
 
-      # Echo outputs for quick copy/paste
       - name: Summary
         if: github.event_name == 'push'
         run: |
-          echo "IMAGE_URI=${{ steps.image.outputs.uri }}"
+          echo "IMAGE_URI=${IMAGE_URI}"
           echo "IMAGE_DIGEST=${{ steps.digest.outputs.digest }}"
 
-      # PAT reachability check (helps distinguish repo string vs PAT scope issues)
+      # PAT reachability check (diagnostics for repo/PAT scope)
       - name: Probe PAT access to deploy repo
         if: github.event_name == 'push'
         run: |
           code=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "Authorization: token ${{ secrets.DEPLOY_REPO_TOKEN }}" \
-            https://api.github.com/repos/PisforFree/ecs-microservice-deploy)
+            https://api.github.com/repos/${{ env.DEPLOY_REPO }})
           echo "HTTP $code from GitHub API"
           test "$code" = "200"
 
@@ -115,15 +123,10 @@ jobs:
         if: github.event_name == 'push'
         uses: actions/checkout@v4
         with:
-          repository: PisforFree/ecs-microservice-deploy
-          ref: main
+          repository: ${{ env.DEPLOY_REPO }}
+          ref: ${{ env.DEPLOY_BRANCH }}
           token: ${{ secrets.DEPLOY_REPO_TOKEN }}
           path: deploy-repo
-
-      - name: Prepare PR env
-        if: github.event_name == 'push'
-        run: |
-          echo "NEW_DIGEST=${{ steps.digest.outputs.digest }}" >> $GITHUB_ENV
 
       - name: Update app.auto.tfvars with new digest
         if: github.event_name == 'push'
@@ -131,8 +134,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          : "${NEW_DIGEST:?NEW_DIGEST env not set}"
 
-          # 1) Try common locations for the file
           CANDIDATES=(
             "environments/dev/app.auto.tfvars"
             "infra/terraform/environments/dev/app.auto.tfvars"
@@ -147,13 +150,9 @@ jobs:
             fi
           done
 
-          # 2) If not found, create the standard path
           if [ -z "${FILE}" ]; then
             FILE="environments/dev/app.auto.tfvars"
             mkdir -p "$(dirname "$FILE")"
-
-            # If your deploy repo defines ecr_repo_uri elsewhere, keep only image_digest here.
-            # Otherwise, set both.
             if ! grep -q "^ecr_repo_uri" "$FILE" 2>/dev/null; then
               echo 'ecr_repo_uri = "803767876973.dkr.ecr.us-east-2.amazonaws.com/microservice"' >> "$FILE"
             fi
@@ -161,11 +160,15 @@ jobs:
             echo "Created $FILE"
           fi
 
-          # 3) Update the digest in whichever file we located/created
-          sed -i -E "s#^image_digest\\s*=\\s*\"sha256:[^\"]+\"#image_digest = \"${NEW_DIGEST}\"#g" "$FILE"
+          # Update digest line (create if missing)
+          if grep -q "^image_digest" "$FILE"; then
+            sed -i -E "s#^image_digest\\s*=\\s*\"sha256:[^\"]+\"#image_digest = \"${NEW_DIGEST}\"#g" "$FILE"
+          else
+            echo "image_digest = \"${NEW_DIGEST}\"" >> "$FILE"
+          fi
 
           echo "Updated line in $FILE:"
-          grep -n "^image_digest" "$FILE"
+          grep -n "^image_digest" "$FILE" || true
 
       - name: Create Pull Request in deploy repo
         if: github.event_name == 'push'
